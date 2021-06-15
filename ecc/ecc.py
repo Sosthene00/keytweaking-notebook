@@ -51,6 +51,8 @@ class FieldElement:
         return self.__class__(num, self.prime)  
 
     def __mul__(self, other):
+        if isinstance(other, S256Point):
+            return int(self.num) * other
         if self.prime != other.prime:
             raise TypeError('Cannot multiply two numbers in different Fields')
         num = (self.num * other.num) % self.prime
@@ -143,9 +145,15 @@ class S256Field(FieldElement):
 
     def __repr__(self):
         return '{:x}'.format(self.num).zfill(64)
+    
+    def to_int(self):
+        return self.num
 
     def sqrt(self):
         return self**((P + 1) // 4)
+    
+    def to_bytes(self, length, order):
+        return self.num.to_bytes(32, 'big')
 
 class S256Point(Point):
 
@@ -160,14 +168,14 @@ class S256Point(Point):
         if self.x is None:
             return 'S256Point(infinity)'
         else:
-            return f'S256Point({self.x}, {self.y})'
+            return self.sec().hex()
 
     def __rmul__(self, coefficient):
         coef = coefficient % N
         return super().__rmul__(coef)
 
-    def verify(self, m, sig):
-        z = generate_secret(m)
+    def verify(self, z, sig):
+        z = int.from_bytes(z, 'big')
         s_inv = pow(sig.s, N - 2, N)
         u = z * s_inv % N
         v = sig.r * s_inv % N
@@ -191,8 +199,8 @@ class S256Point(Point):
     def hash160(self, compressed=True):
         return hash160(self.sec(compressed))
 
-    def address(self, compressed=True, testnet=False):
-        h160 = self.hash160(compressed)
+    def address(self, compressed=True, testnet=True):
+        h160 = self.hash160()
         if testnet:
             prefix = b'\x6f'
         else:
@@ -251,28 +259,45 @@ G = S256Point(Gx, Gy)
 
 class PrivateKey:
 
-    def __init__(self, secret):
+    def __init__(self, secret, compressed=True, testnet=True):
         if type(secret) is not int:
-            self.secret = generate_secret(secret)
+            self.secret = S256Field(generate_secret(secret))
         else:
-            self.secret = secret
+            self.secret = S256Field(secret)
         self.point = self.secret * G
+        self.compressed = compressed
+        self.testnet = testnet
 
     def hex(self):
         return '{:x}'.format(self.secret).zfill(64)
 
-    def sign(self, z):
-        #z = generate_secret(m)
+    def sign(self, z: bytes):
+        # redefine z as an int
+        z = int.from_bytes(z, 'big')
+        
+        # compute the nonce k deterministically
         k = self.deterministic_k(z)
+        
+        # compute r, wich is basically the x coordinate of the point that correspond to k
         r = (k * G).x.num
+        
+        # compute the inverse k
         k_inv = pow(k, N - 2, N)
-        s = (z + r * self.secret) * k_inv % N
+        
+        # we can now compute the signature proper
+        s = (z + r * self.secret.to_int()) * k_inv % N
+        
+        # This is an optimisation to keep the signature slightly smaller
         if s > N / 2:
             s = N - s
+            
+        # the signature is composed of r and s. Both elements are necessary.
         return Signature(r, s)
 
-    def sign_schnorr(self, m):
-        z = ecc.util.generate_secret(m)
+    def sign_schnorr(self, z):
+        # redefine z as an int
+        z = int.from_bytes(z, 'big')
+        
         k = self.deterministic_k(z)
         R = k * G
         e = ecc.util.generate_secret(ecc.util.to_string(self.point, R, m))
@@ -299,37 +324,33 @@ class PrivateKey:
             k = hmac.new(k, v + b'\x00', s256).digest()
             v = hmac.new(k, v, s256).digest()
 
-    def wif(self, compressed=True, testnet=False):
-        secret_bytes = self.secret.to_bytes(32, 'big')
-        if testnet:
+    def wif(self):
+        secret_bytes = self.secret.num.to_bytes(32, 'big')
+        if self.testnet:
             prefix = b'\xef'
         else:
             prefix = b'\x80'
-        if compressed:
+        if self.compressed:
             suffix = b'\x01'
         else:
             suffix = b''
         return encode_base58_checksum(prefix + secret_bytes + suffix)
-        
-    def tweak_privkey(self, tweak):
-        return (self.secret + tweak) % P
 
 # TODO: straighten up this method
     @classmethod
-    def from_wif(self, wif): 
-        num = 0
-        for c in wif:
-            num *= 58
-            num += BASE58_ALPHABET.index(c)
-        combined = num.to_bytes(38, byteorder='big')
-        checksum = combined[-4:]
-        if hash256(combined[:-4])[:4] != checksum:
-            raise ValueError('bad private key {} {}'.format(checksum,
-                hash256(combined[:-4])[:4]))
-        combined = combined[:-4]
+    def from_wif(cls, wif): 
+        compressed = False
+        testnet = True
+        combined = decode_base58(wif, 38)
+        if combined[0] == 128:
+            testnet = False
+        elif combined[0] != 239:
+            raise ValueError(f"Not a valid wif format: wrong network byte {combined[0]}")
         if combined[-1] == 1:
-            secret = combined[:-1]
-        return secret[1:]
+            compressed = True
+            combined = combined[:-1]
+        secret = int.from_bytes(combined[1:], 'big')
+        return cls(secret, compressed, testnet)
 
 
 class Signature:
@@ -338,7 +359,8 @@ class Signature:
         self.s = s
 
     def __repr__(self):
-        return 'Signature({:x},{:x})'.format(self.r, self.s)
+        res = self.der()
+        return res.hex()
 
     def der(self):
             rbin = self.r.to_bytes(32, byteorder='big')
